@@ -1,0 +1,939 @@
+diff --git a/src/Storages/ObjectStorage/S3/Configuration.cpp b/src/Storages/ObjectStorage/S3/Configuration.cpp
+index 9ffc449a1524..33e391dec437 100644
+--- a/src/Storages/ObjectStorage/S3/Configuration.cpp
++++ b/src/Storages/ObjectStorage/S3/Configuration.cpp
+@@ -192,7 +192,8 @@ void StorageS3Configuration::fromNamedCollection(const NamedCollection & collect
+ 
+ void StorageS3Configuration::fromAST(ASTs & args, ContextPtr context, bool with_structure)
+ {
+-    size_t count = StorageURL::evalArgsAndCollectHeaders(args, headers_from_ast, context);
++    std::string tmp_body;
++    size_t count = StorageURL::evalArgsAndCollectHeaders(args, headers_from_ast, tmp_body, context);
+ 
+     if (count == 0 || count > getMaxNumberOfArguments(with_structure))
+         throw Exception(ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH,
+@@ -418,7 +419,8 @@ void StorageS3Configuration::addStructureAndFormatToArgsIfNeeded(
+     else
+     {
+         HTTPHeaderEntries tmp_headers;
+-        size_t count = StorageURL::evalArgsAndCollectHeaders(args, tmp_headers, context);
++        std::string tmp_body;
++        size_t count = StorageURL::evalArgsAndCollectHeaders(args, tmp_headers, tmp_body, context);
+ 
+         if (count == 0 || count > getMaxNumberOfArguments())
+             throw Exception(ErrorCodes::LOGICAL_ERROR, "Expected 1 to {} arguments in table function s3, got {}", getMaxNumberOfArguments(), count);
+diff --git a/src/Storages/StorageURL.cpp b/src/Storages/StorageURL.cpp
+index e81566da251f..0178298e916c 100644
+--- a/src/Storages/StorageURL.cpp
++++ b/src/Storages/StorageURL.cpp
+@@ -5,11 +5,13 @@
+ #include <Storages/VirtualColumnUtils.h>
+ 
+ #include <Interpreters/evaluateConstantExpression.h>
++#include <Interpreters/interpretSubquery.h>
+ #include <Parsers/ASTCreateQuery.h>
+ #include <Parsers/ASTInsertQuery.h>
+ #include <Parsers/ASTLiteral.h>
+ #include <Parsers/ASTFunction.h>
+ #include <Parsers/ASTIdentifier.h>
++#include <Parsers/ASTSubquery.h>
+ 
+ #include <IO/ConnectionTimeouts.h>
+ #include <IO/WriteBufferFromHTTP.h>
+@@ -19,6 +21,7 @@
+ #include <Formats/ReadSchemaUtils.h>
+ #include <Processors/Formats/IInputFormat.h>
+ #include <Processors/Formats/IOutputFormat.h>
++#include <Processors/Executors/CompletedPipelineExecutor.h>
+ #include <Processors/Executors/PullingPipelineExecutor.h>
+ #include <Processors/ISource.h>
+ #include <Processors/Sources/NullSource.h>
+@@ -30,6 +33,7 @@
+ 
+ #include <Interpreters/ExpressionActions.h>
+ 
++#include <Common/LoggingFormatStringHelpers.h>
+ #include <Common/HTTPHeaderFilter.h>
+ #include <Common/OpenTelemetryTraceContext.h>
+ #include <Common/ThreadStatus.h>
+@@ -57,6 +61,7 @@
+ #include <QueryPipeline/QueryPipelineBuilder.h>
+ #include <Poco/Net/HTTPRequest.h>
+ 
++
+ namespace ProfileEvents
+ {
+     extern const Event EngineFileLikeReadFiles;
+@@ -112,6 +117,12 @@ static const std::unordered_set<std::string_view> optional_configuration_keys =
+     "headers.header.value",
+ };
+ 
++static std::function<void(std::ostream &)>  getWriteBodyCallback(const String & body)
++{
++    if (body.empty()) { return nullptr; }
++    return [body](std::ostream & os) {os << body; };
++}
++
+ /// Headers in config file will have structure "headers.header.name" and "headers.header.value".
+ /// But Poco::AbstractConfiguration converts them into "header", "header[1]", "header[2]".
+ static const std::vector<std::shared_ptr<re2::RE2>> optional_regex_keys = {
+@@ -151,6 +162,7 @@ IStorageURLBase::IStorageURLBase(
+     const String & comment,
+     const String & compression_method_,
+     const HTTPHeaderEntries & headers_,
++    const String & body_,
+     const String & http_method_,
+     ASTPtr partition_by_,
+     bool distributed_processing_)
+@@ -160,6 +172,7 @@ IStorageURLBase::IStorageURLBase(
+     , format_name(format_name_)
+     , format_settings(format_settings_)
+     , headers(headers_)
++    , body(body_)
+     , http_method(http_method_)
+     , partition_by(partition_by_)
+     , distributed_processing(distributed_processing_)
+@@ -173,16 +186,16 @@ IStorageURLBase::IStorageURLBase(
+     {
+         ColumnsDescription columns;
+         if (format_name == "auto")
+-            std::tie(columns, format_name) = getTableStructureAndFormatFromData(uri, compression_method, headers, format_settings, context_);
++            std::tie(columns, format_name) = getTableStructureAndFormatFromData(uri, compression_method, headers, body, format_settings, context_);
+         else
+-            columns = getTableStructureFromData(format_name, uri, compression_method, headers, format_settings, context_);
++            columns = getTableStructureFromData(format_name, uri, compression_method, headers, body, format_settings, context_);
+ 
+         storage_metadata.setColumns(columns);
+     }
+     else
+     {
+         if (format_name == "auto")
+-            format_name = getTableStructureAndFormatFromData(uri, compression_method, headers, format_settings, context_).second;
++            format_name = getTableStructureAndFormatFromData(uri, compression_method, headers, body, format_settings, context_).second;
+ 
+         /// We don't allow special columns in URL storage.
+         if (!columns_.hasOnlyOrdinary())
+@@ -777,9 +790,10 @@ namespace
+             std::optional<String> format_,
+             const CompressionMethod & compression_method_,
+             const HTTPHeaderEntries & headers_,
++            const String& body_,
+             const std::optional<FormatSettings> & format_settings_,
+             const ContextPtr & context_)
+-            : WithContext(context_), format(std::move(format_)), compression_method(compression_method_), headers(headers_), format_settings(format_settings_)
++            : WithContext(context_), format(std::move(format_)), compression_method(compression_method_), headers(headers_), body(body_), format_settings(format_settings_)
+         {
+             url_options_to_check.reserve(urls_to_check_.size());
+             for (const auto & url : urls_to_check_)
+@@ -860,8 +874,8 @@ namespace
+                     url_options_to_check[current_index].cend(),
+                     getContext(),
+                     {},
+-                    Poco::Net::HTTPRequest::HTTP_GET,
+-                    {},
++                    "",
++                    getWriteBodyCallback(body),
+                     getHTTPTimeouts(getContext()),
+                     credentials,
+                     headers,
+@@ -928,8 +942,8 @@ namespace
+                 url_options_to_check[current_index - 1].cend(),
+                 getContext(),
+                 {},
+-                Poco::Net::HTTPRequest::HTTP_GET,
+-                {},
++                "",
++                getWriteBodyCallback(body),
+                 getHTTPTimeouts(getContext()),
+                 credentials,
+                 headers,
+@@ -952,7 +966,7 @@ namespace
+             {
+                 auto get_last_mod_time = [&]() -> std::optional<time_t>
+                 {
+-                    auto last_mod_time = StorageURL::tryGetLastModificationTime(url, headers, credentials, context);
++                    auto last_mod_time = StorageURL::tryGetLastModificationTime(url, headers, body, credentials, context);
+                     /// Some URLs could not have Last-Modified header, in this case we cannot be sure that
+                     /// data wasn't changed after adding it's schema to cache. Use schema from cache only if
+                     /// special setting for this case is enabled.
+@@ -993,6 +1007,7 @@ namespace
+         std::optional<String> format;
+         const CompressionMethod & compression_method;
+         const HTTPHeaderEntries & headers;
++        const String& body;
+         Poco::Net::HTTPBasicCredentials credentials;
+         const std::optional<FormatSettings> & format_settings;
+     };
+@@ -1003,6 +1018,7 @@ std::pair<ColumnsDescription, String> IStorageURLBase::getTableStructureAndForma
+     const String & uri,
+     CompressionMethod compression_method,
+     const HTTPHeaderEntries & headers,
++    const String& body,
+     const std::optional<FormatSettings> & format_settings,
+     const ContextPtr & context)
+ {
+@@ -1016,7 +1032,7 @@ std::pair<ColumnsDescription, String> IStorageURLBase::getTableStructureAndForma
+     else
+         urls_to_check = {uri};
+ 
+-    ReadBufferIterator read_buffer_iterator(urls_to_check, format, compression_method, headers, format_settings, context);
++    ReadBufferIterator read_buffer_iterator(urls_to_check, format, compression_method, headers, body, format_settings, context);
+     if (format)
+         return {readSchemaFromFormat(*format, format_settings, read_buffer_iterator, context), *format};
+     return detectFormatAndReadSchema(format_settings, read_buffer_iterator, context);
+@@ -1027,20 +1043,22 @@ ColumnsDescription IStorageURLBase::getTableStructureFromData(
+     const String & uri,
+     CompressionMethod compression_method,
+     const HTTPHeaderEntries & headers,
++    const String& body,
+     const std::optional<FormatSettings> & format_settings,
+     const ContextPtr & context)
+ {
+-    return getTableStructureAndFormatFromDataImpl(format, uri, compression_method, headers, format_settings, context).first;
++    return getTableStructureAndFormatFromDataImpl(format, uri, compression_method, headers, body, format_settings, context).first;
+ }
+ 
+ std::pair<ColumnsDescription, String> IStorageURLBase::getTableStructureAndFormatFromData(
+     const String & uri,
+     CompressionMethod compression_method,
+     const HTTPHeaderEntries & headers,
++    const String& body,
+     const std::optional<FormatSettings> & format_settings,
+     const ContextPtr & context)
+ {
+-    return getTableStructureAndFormatFromDataImpl(std::nullopt, uri, compression_method, headers, format_settings, context);
++    return getTableStructureAndFormatFromDataImpl(std::nullopt, uri, compression_method, headers, body, format_settings, context);
+ }
+ 
+ bool IStorageURLBase::supportsSubsetOfColumns(const ContextPtr & context) const
+@@ -1250,13 +1268,14 @@ void ReadFromURL::initializePipeline(QueryPipelineBuilder & pipeline, const Buil
+ 
+     const size_t max_parsing_threads = num_streams >= settings[Setting::max_parsing_threads] ? 1 : (settings[Setting::max_parsing_threads] / num_streams);
+ 
++    auto body_post_callback = getWriteBodyCallback(storage->body);
+     for (size_t i = 0; i < num_streams; ++i)
+     {
+         auto source = std::make_shared<StorageURLSource>(
+             info,
+             iterator_wrapper,
+-            storage->getReadMethod(),
+-            read_post_data_callback,
++            read_post_data_callback ? storage->getReadMethod() : "",
++            read_post_data_callback ? read_post_data_callback : body_post_callback,
+             storage->format_name,
+             storage->format_settings,
+             storage->getName(),
+@@ -1384,6 +1403,7 @@ SchemaCache & IStorageURLBase::getSchemaCache(const ContextPtr & context)
+ std::optional<time_t> IStorageURLBase::tryGetLastModificationTime(
+     const String & url,
+     const HTTPHeaderEntries & headers,
++    const String& body,
+     const Poco::Net::HTTPBasicCredentials & credentials,
+     const ContextPtr & context)
+ {
+@@ -1402,6 +1422,7 @@ std::optional<time_t> IStorageURLBase::tryGetLastModificationTime(
+                    .withRedirects(settings[Setting::max_http_get_redirects])
+                    .withHeaders(headers)
+                    .withProxy(proxy_config)
++                   .withOutCallback(getWriteBodyCallback(body))
+                    .create(credentials);
+ 
+     return buf->tryGetLastModificationTime();
+@@ -1418,6 +1439,7 @@ StorageURL::StorageURL(
+     const ContextPtr & context_,
+     const String & compression_method_,
+     const HTTPHeaderEntries & headers_,
++    const String& body_,
+     const String & http_method_,
+     ASTPtr partition_by_,
+     bool distributed_processing_)
+@@ -1432,6 +1454,7 @@ StorageURL::StorageURL(
+         comment,
+         compression_method_,
+         headers_,
++        body_,
+         http_method_,
+         partition_by_,
+         distributed_processing_)
+@@ -1490,15 +1513,36 @@ FormatSettings StorageURL::getFormatSettingsFromArgs(const StorageFactory::Argum
+     return format_settings;
+ }
+ 
++std::string evaluateBodySubqueryToString(ASTPtr body_ptr, const std::optional<String>& format, const ContextPtr & context)
++{
++    auto write_buffer = WriteBufferFromOwnString();
++
++    BlockIO block = interpretSubquery(body_ptr, context, {}, {})->execute();
++    auto out = context->getOutputFormat(format.value_or("JSONLines"), write_buffer, materializeBlock(block.pipeline.getHeader()));
++    out->setAutoFlush();
++    block.pipeline.complete(std::move(out));
++    CompletedPipelineExecutor(block.pipeline).execute();
++
++    auto result = write_buffer.str();
++    LOG_DEBUG(getLogger("StorageURLDistributed"), "Interpreted body subquery, result size is:\t\t{}", result);
++    return result;
++}
++
++
+ size_t StorageURL::evalArgsAndCollectHeaders(
+-    ASTs & url_function_args, HTTPHeaderEntries & header_entries, const ContextPtr & context, bool evaluate_arguments)
++    ASTs & url_function_args,
++    HTTPHeaderEntries & header_entries,
++    std::string & body_entry,
++    const ContextPtr & context,
++    bool evaluate_arguments)
+ {
+     ASTs::iterator headers_it = url_function_args.end();
++    ASTs::iterator body_it = url_function_args.end();
+ 
+     for (auto * arg_it = url_function_args.begin(); arg_it != url_function_args.end(); ++arg_it)
+     {
+-        const auto * headers_ast_function = (*arg_it)->as<ASTFunction>();
+-        if (headers_ast_function && headers_ast_function->name == "headers")
++        const auto * ast_as_function = (*arg_it)->as<ASTFunction>();
++        if (ast_as_function && ast_as_function->name == "headers")
+         {
+             if (headers_it != url_function_args.end())
+                 throw Exception(
+@@ -1506,7 +1550,7 @@ size_t StorageURL::evalArgsAndCollectHeaders(
+                     "URL table function can have only one key-value argument: headers=(). {}",
+                     bad_arguments_error_message);
+ 
+-            const auto * headers_function_args_expr = assert_cast<const ASTExpressionList *>(headers_ast_function->arguments.get());
++            const auto * headers_function_args_expr = assert_cast<const ASTExpressionList *>(ast_as_function->arguments.get());
+             auto headers_function_args = headers_function_args_expr->children;
+ 
+             for (auto & header_arg : headers_function_args)
+@@ -1519,9 +1563,7 @@ size_t StorageURL::evalArgsAndCollectHeaders(
+                 auto header_args = header_args_expr->children;
+                 if (header_args.size() != 2)
+                     throw Exception(
+-                        ErrorCodes::BAD_ARGUMENTS,
+-                        "Headers argument is incorrect: expected 2 arguments, got {}",
+-                        header_args.size());
++                        ErrorCodes::BAD_ARGUMENTS, "Headers argument is incorrect: expected 2 arguments, got {}", header_args.size());
+ 
+                 auto ast_literal = evaluateConstantExpressionOrIdentifierAsLiteral(header_args[0], context);
+                 auto arg_name_value = ast_literal->as<ASTLiteral>()->value;
+@@ -1542,7 +1584,62 @@ size_t StorageURL::evalArgsAndCollectHeaders(
+             continue;
+         }
+ 
+-        if (headers_ast_function && headers_ast_function->name == "equals")
++
++        if (ast_as_function && ast_as_function->name == "body")
++        {
++            if (body_it != url_function_args.end())
++            {
++                throw Exception(
++                    ErrorCodes::BAD_ARGUMENTS,
++                    "URL table function can have only one string argument body=(). {}",
++                    bad_arguments_error_message);
++            }
++            const auto * body_function_args_expr = assert_cast<const ASTExpressionList *>(ast_as_function->arguments.get());
++            auto body_function_args = body_function_args_expr->children;
++
++            if (body_function_args.empty() || body_function_args.size() > 2)
++            {
++                throw Exception(
++                    ErrorCodes::BAD_ARGUMENTS,
++                    "URL table function argument body=() excepts a one or two arguments {}",
++                    bad_arguments_error_message);
++            }
++
++            const auto& input_argument = body_function_args[0];
++            if (input_argument->as<ASTSubquery>())
++            {
++                LOG_DEBUG(getLogger("StorageURLDistributed"), "Got a subquery in body arg, trying to evaluate it ...");
++                std::optional<String> format;
++                if (body_function_args.size() == 2)
++                {
++                    const auto& format_argument = body_function_args[1];
++                    auto ast_literal = evaluateConstantExpressionOrIdentifierAsLiteral(format_argument, context);
++                    auto arg_name_value = ast_literal->as<ASTLiteral>()->value;
++                    if (arg_name_value.getType() != Field::Types::Which::String)
++                        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Expected string as body argument");
++                    format = arg_name_value.safeGet<String>();
++                }
++                auto body_result = evaluateBodySubqueryToString(input_argument, format, context);
++                LOG_DEBUG(getLogger("StorageURLDistributed"), "Got a subquery in body arg, tryyin to evaluate it done");
++                body_entry = body_result;
++            }
++            else
++            {
++                auto ast_literal = evaluateConstantExpressionOrIdentifierAsLiteral(input_argument, context);
++                auto arg_name_value = ast_literal->as<ASTLiteral>()->value;
++
++                if (arg_name_value.getType() != Field::Types::Which::String)
++                    throw Exception(ErrorCodes::BAD_ARGUMENTS, "Expected string as body argument");
++                auto body_argument = arg_name_value.safeGet<String>();
++                LOG_DEBUG(getLogger("StorageURLDistributed"), "Got a body argument:    {}", body_argument);
++                body_entry = body_argument;
++            }
++            body_it = arg_it;
++            LOG_DEBUG(getLogger("StorageURLDistributed"), "Saving a body argument done");
++            continue;
++        }
++
++        if (ast_as_function && ast_as_function->name == "equals")
+             continue;
+ 
+         if (evaluate_arguments)
+@@ -1551,11 +1648,26 @@ size_t StorageURL::evalArgsAndCollectHeaders(
+ 
+     if (headers_it == url_function_args.end())
+         return url_function_args.size();
+-
+-    std::rotate(headers_it, std::next(headers_it), url_function_args.end());
+-    return url_function_args.size() - 1;
++    if (body_it == url_function_args.end())
++    {
++        std::rotate(headers_it, std::next(headers_it), url_function_args.end()); // i guess we move headers to the end
++        return url_function_args.size() - 1;
++    }
++    LOG_DEBUG(getLogger("StorageURLDistributed"), "Hiding body args in the end, but before headers arg...");
++    if (std::next(body_it) == url_function_args.end())
++    {
++        std::swap(*body_it, *headers_it); // move headers to the end
++        std::swap(*headers_it, *std::prev(std::prev(url_function_args.end()))); // move body next to headers
++    }
++    else
++    {
++        std::swap(*headers_it, *std::prev(url_function_args.end())); // move headers to the end
++        std::swap(*body_it, *std::prev(std::prev(url_function_args.end()))); // move body next to headers
++    }
++    return url_function_args.size() - 2;
+ }
+ 
++
+ void StorageURL::processNamedCollectionResult(Configuration & configuration, const NamedCollection & collection)
+ {
+     validateNamedCollection(collection, required_configuration_keys, optional_configuration_keys, optional_regex_keys);
+@@ -1588,13 +1700,13 @@ StorageURL::Configuration StorageURL::getConfiguration(ASTs & args, const Contex
+     if (auto named_collection = tryGetNamedCollectionWithOverrides(args, local_context))
+     {
+         StorageURL::processNamedCollectionResult(configuration, *named_collection);
+-        evalArgsAndCollectHeaders(args, configuration.headers, local_context, false);
++        evalArgsAndCollectHeaders(args, configuration.headers, configuration.body, local_context, false);
+     }
+     else
+     {
+-        size_t count = evalArgsAndCollectHeaders(args, configuration.headers, local_context);
++        size_t count = evalArgsAndCollectHeaders(args, configuration.headers, configuration.body, local_context);
+ 
+-        if (count == 0 || count > 3)
++        if (count == 0 || count > 3) // TODO: take care of _body_ argument
+             throw Exception(ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH, bad_arguments_error_message);
+ 
+         configuration.url = checkAndGetLiteralArgument<String>(args[0], "url");
+@@ -1642,6 +1754,7 @@ void registerStorageURL(StorageFactory & factory)
+                 args.getContext(),
+                 configuration.compression_method,
+                 configuration.headers,
++                configuration.body,
+                 configuration.http_method,
+                 partition_by);
+         },
+diff --git a/src/Storages/StorageURL.h b/src/Storages/StorageURL.h
+index 9869bdf28ba9..87fdc2f485d5 100644
+--- a/src/Storages/StorageURL.h
++++ b/src/Storages/StorageURL.h
+@@ -54,6 +54,7 @@ class IStorageURLBase : public IStorage
+         const String & uri,
+         CompressionMethod compression_method,
+         const HTTPHeaderEntries & headers,
++        const String & body,
+         const std::optional<FormatSettings> & format_settings,
+         const ContextPtr & context);
+ 
+@@ -61,6 +62,7 @@ class IStorageURLBase : public IStorage
+         const String & uri,
+         CompressionMethod compression_method,
+         const HTTPHeaderEntries & headers,
++        const String & body,
+         const std::optional<FormatSettings> & format_settings,
+         const ContextPtr & context);
+ 
+@@ -70,6 +72,7 @@ class IStorageURLBase : public IStorage
+     static std::optional<time_t> tryGetLastModificationTime(
+         const String & url,
+         const HTTPHeaderEntries & headers,
++        const String & body,
+         const Poco::Net::HTTPBasicCredentials & credentials,
+         const ContextPtr & context);
+ 
+@@ -87,6 +90,7 @@ class IStorageURLBase : public IStorage
+         const String & comment,
+         const String & compression_method_,
+         const HTTPHeaderEntries & headers_ = {},
++        const String & body_ = "",
+         const String & method_ = "",
+         ASTPtr partition_by = nullptr,
+         bool distributed_processing_ = false);
+@@ -100,6 +104,7 @@ class IStorageURLBase : public IStorage
+     // In this case, format_settings is not set.
+     std::optional<FormatSettings> format_settings;
+     HTTPHeaderEntries headers;
++    String body;
+     String http_method; /// For insert can choose Put instead of default Post.
+     ASTPtr partition_by;
+     bool distributed_processing;
+@@ -136,6 +141,7 @@ class IStorageURLBase : public IStorage
+         const String & uri,
+         CompressionMethod compression_method,
+         const HTTPHeaderEntries & headers,
++        const String& body,
+         const std::optional<FormatSettings> & format_settings,
+         const ContextPtr & context);
+ 
+@@ -230,6 +236,7 @@ class StorageURLSource : public SourceWithKeyCondition, WithContext
+     String format;
+     const std::optional<FormatSettings> & format_settings;
+     HTTPHeaderEntries headers;
++    String body;
+     bool need_only_count;
+     size_t total_rows_in_file = 0;
+ 
+@@ -287,6 +294,7 @@ class StorageURL : public IStorageURLBase
+         const ContextPtr & context_,
+         const String & compression_method_,
+         const HTTPHeaderEntries & headers_ = {},
++        const std::string & body_ = "",
+         const String & method_ = "",
+         ASTPtr partition_by_ = nullptr,
+         bool distributed_processing_ = false);
+@@ -316,6 +324,7 @@ class StorageURL : public IStorageURLBase
+         std::string http_method;
+         HTTPHeaderEntries headers;
+         std::string addresses_expr;
++        std::string body;
+     };
+ 
+     static Configuration getConfiguration(ASTs & args, const ContextPtr & context);
+@@ -323,7 +332,7 @@ class StorageURL : public IStorageURLBase
+     /// Does evaluateConstantExpressionOrIdentifierAsLiteral() on all arguments.
+     /// If `headers(...)` argument is present, parses it and moves it to the end of the array.
+     /// Returns number of arguments excluding `headers(...)`.
+-    static size_t evalArgsAndCollectHeaders(ASTs & url_function_args, HTTPHeaderEntries & header_entries, const ContextPtr & context, bool evaluate_arguments = true);
++    static size_t evalArgsAndCollectHeaders(ASTs & url_function_args, HTTPHeaderEntries & header_entries, std::string& body_entry, const ContextPtr & context, bool evaluate_arguments = true);
+ 
+     static void processNamedCollectionResult(Configuration & configuration, const NamedCollection & collection);
+ };
+diff --git a/src/Storages/StorageURLCluster.cpp b/src/Storages/StorageURLCluster.cpp
+index 2600f8105ea3..1db225e603cf 100644
+--- a/src/Storages/StorageURLCluster.cpp
++++ b/src/Storages/StorageURLCluster.cpp
+@@ -64,10 +64,10 @@ StorageURLCluster::StorageURLCluster(
+         ColumnsDescription columns;
+         if (format_name == "auto")
+             std::tie(columns, format_name) = StorageURL::getTableStructureAndFormatFromData(
+-                uri, chooseCompressionMethod(Poco::URI(uri).getPath(), compression_method), configuration_.headers, std::nullopt, context);
++                uri, chooseCompressionMethod(Poco::URI(uri).getPath(), compression_method), configuration_.headers, configuration_.body, std::nullopt, context);
+         else
+             columns = StorageURL::getTableStructureFromData(
+-                format_, uri, chooseCompressionMethod(Poco::URI(uri).getPath(), compression_method), configuration_.headers, std::nullopt, context);
++                format_, uri, chooseCompressionMethod(Poco::URI(uri).getPath(), compression_method), configuration_.headers, configuration_.body, std::nullopt, context);
+ 
+         storage_metadata.setColumns(columns);
+     }
+@@ -75,7 +75,7 @@ StorageURLCluster::StorageURLCluster(
+     {
+         if (format_name == "auto")
+             format_name = StorageURL::getTableStructureAndFormatFromData(
+-                uri, chooseCompressionMethod(Poco::URI(uri).getPath(), compression_method), configuration_.headers, std::nullopt, context).second;
++                uri, chooseCompressionMethod(Poco::URI(uri).getPath(), compression_method), configuration_.headers, configuration_.body, std::nullopt, context).second;
+ 
+         storage_metadata.setColumns(columns_);
+     }
+diff --git a/src/TableFunctions/TableFunctionURL.cpp b/src/TableFunctions/TableFunctionURL.cpp
+index 5af4138574c3..bffdf1aaab62 100644
+--- a/src/TableFunctions/TableFunctionURL.cpp
++++ b/src/TableFunctions/TableFunctionURL.cpp
+@@ -40,9 +40,14 @@ std::vector<size_t> TableFunctionURL::skipAnalysisForArguments(const QueryTreeNo
+ 
+     for (size_t i = 0; i < table_function_arguments_size; ++i)
+     {
+-        auto * function_node = table_function_arguments_nodes[i]->as<FunctionNode>();
+-        if (function_node && function_node->getFunctionName() == "headers")
+-            result.push_back(i);
++        if (auto * function_node = table_function_arguments_nodes[i]->as<FunctionNode>())
++        {
++            const auto & function_name = function_node->getFunctionName();
++            if (function_name == "headers" || function_name == "body")
++            {
++                result.push_back(i);
++            }
++        }
+     }
+ 
+     return result;
+@@ -68,22 +73,40 @@ void TableFunctionURL::parseArgumentsImpl(ASTs & args, const ContextPtr & contex
+         if (format == "auto")
+             format = FormatFactory::instance().tryGetFormatFromFileName(Poco::URI(filename).getPath()).value_or("auto");
+ 
+-        StorageURL::evalArgsAndCollectHeaders(args, configuration.headers, context);
++        StorageURL::evalArgsAndCollectHeaders(args, configuration.headers, configuration.body, context);
+     }
+     else
+     {
+-        size_t count = StorageURL::evalArgsAndCollectHeaders(args, configuration.headers, context);
++        size_t count = StorageURL::evalArgsAndCollectHeaders(args, configuration.headers, configuration.body, context);
++        /// ITableFunctionFileLike cannot parse _headers_ and _body_ argument, so remove it.
++        ASTPtr body_ast;
+         /// ITableFunctionFileLike cannot parse headers argument, so remove it.
+         ASTPtr headers_ast;
+         if (count != args.size())
+         {
+-            chassert(count + 1 == args.size());
+-            headers_ast = args.back();
+-            args.pop_back();
++            if (count + 1 == args.size())
++            {
++                headers_ast = args.back();
++                args.pop_back();
++            }
++            else if (count + 2 == args.size())
++            {
++                headers_ast = args.back();
++                args.pop_back();
++                body_ast = args.back();
++                args.pop_back();
++            }
++            else
++            {
++                chassert(false);
++            }
+         }
+ 
+         ITableFunctionFileLike::parseArgumentsImpl(args, context);
+ 
++        if (body_ast)
++            args.push_back(body_ast);
++
+         if (headers_ast)
+             args.push_back(headers_ast);
+     }
+@@ -128,6 +151,7 @@ StoragePtr TableFunctionURL::getStorage(
+         global_context,
+         compression_method_,
+         configuration.headers,
++        configuration.body,
+         configuration.http_method,
+         nullptr,
+         /*distributed_processing=*/ is_secondary_query);
+@@ -143,6 +167,7 @@ ColumnsDescription TableFunctionURL::getActualTableStructure(ContextPtr context,
+                        filename,
+                        chooseCompressionMethod(Poco::URI(filename).getPath(), compression_method),
+                        configuration.headers,
++                       configuration.body,
+                        std::nullopt,
+                        context).first;
+ 
+@@ -150,6 +175,7 @@ ColumnsDescription TableFunctionURL::getActualTableStructure(ContextPtr context,
+             filename,
+             chooseCompressionMethod(Poco::URI(filename).getPath(), compression_method),
+             configuration.headers,
++            configuration.body,
+             std::nullopt,
+             context);
+     }
+diff --git a/src/TableFunctions/TableFunctionURL.h b/src/TableFunctions/TableFunctionURL.h
+index 4b53f50d0b33..07041c8c4f41 100644
+--- a/src/TableFunctions/TableFunctionURL.h
++++ b/src/TableFunctions/TableFunctionURL.h
+@@ -60,7 +60,8 @@ class TableFunctionURL : public ITableFunctionFileLike
+         {
+             /// If arguments contain headers, just remove it and add to the end of arguments later.
+             HTTPHeaderEntries tmp_headers;
+-            size_t count = StorageURL::evalArgsAndCollectHeaders(args, tmp_headers, context);
++            std::string tmp_body;
++            size_t count = StorageURL::evalArgsAndCollectHeaders(args, tmp_headers, tmp_body, context);
+             ASTPtr headers_ast;
+             if (count != args.size())
+             {
+diff --git a/src/TableFunctions/TableFunctionURLCluster.cpp b/src/TableFunctions/TableFunctionURLCluster.cpp
+index 84354d044143..d4901041c667 100644
+--- a/src/TableFunctions/TableFunctionURLCluster.cpp
++++ b/src/TableFunctions/TableFunctionURLCluster.cpp
+@@ -24,6 +24,7 @@ StoragePtr TableFunctionURLCluster::getStorage(
+             context,
+             compression_method,
+             configuration.headers,
++            configuration.body,
+             configuration.http_method,
+             nullptr,
+             /*distributed_processing=*/ true);
+diff --git a/tests/integration/test_storage_url_http_body/__init__.py b/tests/integration/test_storage_url_http_body/__init__.py
+new file mode 100644
+index 000000000000..e69de29bb2d1
+diff --git a/tests/integration/test_storage_url_http_body/http_headers_echo_server.py b/tests/integration/test_storage_url_http_body/http_headers_echo_server.py
+new file mode 100644
+index 000000000000..24607478b268
+--- /dev/null
++++ b/tests/integration/test_storage_url_http_body/http_headers_echo_server.py
+@@ -0,0 +1,68 @@
++import http.server
++import json
++import sys
++
++RESULT_PATH = "/echo_server_headers.txt"
++ 
++class RequestHandler(http.server.BaseHTTPRequestHandler):
++    def log_body(self, results):
++        with open(RESULT_PATH, "w") as f:
++            f.write(results)
++
++    def do_GET(self): # for health-check in docker startup script
++        self.send_response(200)
++        self.send_header("Content-Type", "text/plain")
++        self.end_headers()
++        self.wfile.write(b'{"status":"ok"}')
++
++
++
++    def do_POST(self):
++        transfer_encoding = self.headers.get('Transfer-Encoding')
++        if transfer_encoding == 'chunked':
++            body, body_length = self.read_chunked()
++        else:
++            content_length = int(self.headers.get('Content-Length', 0))
++            body, body_length = self.rfile.read(content_length).decode('utf-8', errors='replace'), content_length
++
++        self.log_body(body)
++        print("-" * 60)
++        self.send_response(200)
++        self.send_header("Content-Type", "text/plain")
++        self.end_headers()
++        self.wfile.write(b'{"status":"ok"}')
++        return
++
++    def read_chunked(self):
++        body = []
++        read_bytes = 0
++        while True:
++            chunk_size_line = self.rfile.readline().strip()
++            if not chunk_size_line:
++                break
++            chunk_size = int(chunk_size_line, 16)
++            if chunk_size == 0:
++                break
++            chunk_data = self.rfile.read(chunk_size)
++            read_bytes += len(chunk_data)
++            body.append(chunk_data.decode('utf-8', errors='replace'))
++            self.rfile.readline()
++        return ''.join(body), read_bytes
++    
++
++
++if __name__ == "__main__":
++    host = sys.argv[1]
++    port = int(sys.argv[2])
++    httpd = http.server.ThreadingHTTPServer(
++        (
++            host,
++            port,
++        ),
++        RequestHandler,
++    )
++
++    try:
++        httpd.serve_forever()
++    finally:
++        httpd.server_close()
+diff --git a/tests/integration/test_storage_url_http_body/redirect_server.py b/tests/integration/test_storage_url_http_body/redirect_server.py
+new file mode 100644
+index 000000000000..90ef2f795754
+--- /dev/null
++++ b/tests/integration/test_storage_url_http_body/redirect_server.py
+@@ -0,0 +1,62 @@
++import http.server
++import sys
++
++REDIRECT_HOST = ""
++REDIRECT_PORT = 0
++
++RESULT_PATH = "/redirect_server_headers.txt"
++
++
++class RequestHandler(http.server.BaseHTTPRequestHandler):
++    def log_message(self, *args):
++        with open(RESULT_PATH, "w") as f:
++            f.write(self.headers.as_string())
++
++    def do_GET(self):
++        if self.path == "/":
++            self.send_response(200)
++            self.send_header("Content-Type", "text/plain")
++            self.end_headers()
++            self.wfile.write(b'{"status":"ok"}')
++        else:
++            global REDIRECT_HOST, REDIRECT_PORT
++            self.send_response(302)
++            target_location = f"http://{REDIRECT_HOST}:{REDIRECT_PORT}{self.path}"
++            self.send_header("Location", target_location)
++            self.end_headers()
++            self.wfile.write(b'{"status":"redirected"}')
++            
++    def do_POST(self):
++        if self.path == "/":
++            self.send_response(200)
++            self.send_header("Content-Type", "text/plain")
++            self.end_headers()
++            self.wfile.write(b'{"status":"ok"}')
++        else:
++            global REDIRECT_HOST, REDIRECT_PORT
++            self.send_response(302)
++            target_location = f"http://{REDIRECT_HOST}:{REDIRECT_PORT}{self.path}"
++            self.send_header("Location", target_location)
++            self.end_headers()
++            self.wfile.write(b'{"status":"redirected"}')
++
++
++
++
++if __name__ == "__main__":
++    host = sys.argv[1]
++    port = int(sys.argv[2])
++    REDIRECT_HOST = sys.argv[3]
++    REDIRECT_PORT = int(sys.argv[4])
++    httpd = http.server.ThreadingHTTPServer(
++        (
++            host,
++            port,
++        ),
++        RequestHandler,
++    )
++
++    try:
++        httpd.serve_forever()
++    finally:
++        httpd.server_close()
+diff --git a/tests/integration/test_storage_url_http_body/test.py b/tests/integration/test_storage_url_http_body/test.py
+new file mode 100644
+index 000000000000..2beab849814c
+--- /dev/null
++++ b/tests/integration/test_storage_url_http_body/test.py
+@@ -0,0 +1,122 @@
++import os
++
++import pytest
++
++from helpers.cluster import ClickHouseCluster
++
++from . import http_headers_echo_server, redirect_server
++
++cluster = ClickHouseCluster(__file__)
++server = cluster.add_instance("node")
++
++
++def run_server(container_id, file_name, hostname, port, *args):
++    script_dir = os.path.dirname(os.path.realpath(__file__))
++
++    cluster.copy_file_to_container(
++        container_id,
++        os.path.join(script_dir, file_name),
++        f"/{file_name}",
++    )
++
++    cmd_args = [hostname, port] + list(args)
++    cmd_args_val = " ".join([str(x) for x in cmd_args])
++
++    cluster.exec_in_container(
++        container_id,
++        [
++            "bash",
++            "-c",
++            f"python3 /{file_name} {cmd_args_val} > {file_name}.log 2>&1",
++        ],
++        detach=True,
++        user="root",
++    )
++
++    for _ in range(0, 10):
++        ping_response = cluster.exec_in_container(
++            container_id,
++            ["curl", "-s", f"http://{hostname}:{port}/"],
++            nothrow=True,
++        )
++
++        if '{"status":"ok"}' in ping_response:
++            return
++
++    raise Exception("Echo server is not responding")
++
++
++def run_echo_server():
++    container_id = cluster.get_container_id("node")
++    run_server(container_id, "http_headers_echo_server.py", "localhost", 8000)
++
++
++def run_redirect_server():
++    container_id = cluster.get_container_id("node")
++    run_server(container_id, "redirect_server.py", "localhost", 8080, "localhost", 8000)
++
++
++@pytest.fixture(scope="module")
++def started_cluster():
++    try:
++        cluster.start()
++        run_redirect_server()
++        run_echo_server()
++
++        yield cluster
++    finally:
++        cluster.shutdown()
++
++
++def run_test(input_query, expected):
++    server.query(input_query)
++    result = server.exec_in_container(
++        ["cat", http_headers_echo_server.RESULT_PATH], user="root"
++    )
++    print(result)
++    assert expected in result
++    
++
++def test_simple_string_in_http_body(started_cluster):
++    query = "SELECT * FROM url('http://localhost:8000/', headers('type'='string'), body('test'))"
++    simple_string = 'test'
++    
++    run_test(query, simple_string)
++    
++def test_simple_subquery_in_http_body(started_cluster):
++    query = "SELECT * FROM url('http://localhost:8000/', headers('type'='string'), body((SELECT 1 + 2)))"
++    simple_subquery_body = '{"plus(1, 2)":3}'
++    
++    run_test(query, simple_subquery_body)
++ 
++ 
++generator_subquery = '''
++SELECT * FROM (
++    SELECT 1 as id, 'Vasya' as name, 123 as number UNION ALL
++    SELECT 2 as id, 'Kolya' as name, 456 as number UNION ALL
++    SELECT 3 as id, 'Dima' as name,  789 as number)
++ORDER BY id
++'''
++
++def test_subquery_result_default_format_in_http_body(started_cluster): # default format is JSONLines
++    json_each_row_dump = '''{"id":1,"name":"Vasya","number":123}\n{"id":2,"name":"Kolya","number":456}\n{"id":3,"name":"Dima","number":789}'''
++    query = f"SELECT * FROM url('http://localhost:8000/', headers('type'='string'), body(({generator_subquery})))"
++    run_test(query, json_each_row_dump)
++
++
++def test_subquery_result_json_in_http_body(started_cluster):
++    json_each_row_dump = '''{"id":1,"name":"Vasya","number":123}\n{"id":2,"name":"Kolya","number":456}\n{"id":3,"name":"Dima","number":789}'''
++    query = f"SELECT * FROM url('http://localhost:8000/', headers('type'='string'), body(({generator_subquery}), JSONLines))"
++    run_test(query, json_each_row_dump)
++
++
++def test_subquery_result_csv_in_http_body(started_cluster):
++    tab_separate_each_row_dump = '''1	Vasya	123\n2	Kolya	456\n3	Dima	789'''
++    query = f"SELECT * FROM url('http://localhost:8000/', headers('type'='string'), body(({generator_subquery}), TabSeparated))"
++    run_test(query, tab_separate_each_row_dump)
++
++
++def test_subquery_result_csv_in_http_body(started_cluster):
++    csv_separate_each_row_dump = '''"id","name","number"\n1,"Vasya",123\n2,"Kolya",456\n3,"Dima",789'''
++    query = f"SELECT * FROM url('http://localhost:8000/', headers('type'='string'), body(({generator_subquery}), CSVWithNames))"
++    run_test(query, csv_separate_each_row_dump)
+\ No newline at end of file
